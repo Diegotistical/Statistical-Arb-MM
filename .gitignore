@@ -1,0 +1,24 @@
+# C++ Build Artifacts
+build/
+bin/
+lib/
+*.o
+*.so
+*.dylib
+*.exe
+*.dll
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+.pytest_cache/
+venv/
+
+# Data
+data/raw/*
+data/processed/*
+!data/samples/
+.env
+.DS_Store
