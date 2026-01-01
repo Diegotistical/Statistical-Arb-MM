@@ -51,7 +51,7 @@ Unlike standard pairs trading, this engine incorporates L1/L2 order book dynamic
 
 ### Prerequisites
 * **C++ Compiler:** GCC 10+, Clang 10+, or MSVC 2019+ (Must support C++20)
-* **Python:** 3.8+
+* **Python:** 3.11+
 * **CMake:** 3.14+
 
 ### Build Instructions
@@ -61,44 +61,34 @@ Unlike standard pairs trading, this engine incorporates L1/L2 order book dynamic
 git clone https://github.com/Diegotistical/Statistical-Arb-MM.git
 cd Statistical-Arb-MM
 mkdir build && cd build
+```
 
 **2. Compile the Engine**
 
+**Linux / macOS**
 ```bash
-# Linux / macOS
 cmake ..
 make -j4
-
-# Windows (PowerShell)
-cmake --build . --config Release
-
-Here is the text converted into clean, copy-pasteable Markdown format. I have added the appropriate code blocks and bolding to make it readable on GitHub.
-
-Markdown
-
-### 2. Compile the Engine
-
+```
+**Windows (PowerShell)**
 ```bash
-# Linux / macOS
-cmake ..
-make -j4
-
-# Windows (PowerShell)
 cmake --build . --config Release
-3. Run the "Steel Thread" Test
+```
+
+**3. Run the "Steel Thread" Test**
 Verify the C++ engine is callable from Python:
 
 ```bash
 
-python3 -c "import sys, os; sys.path.append('python'); import stat_arb_mm; engine = stat_arb_mm.MatchingEngine(); engine.print_status()"
+python3 -c "import sys, os;
+sys.path.append('python');
+import stat_arb_mm; engine = stat_arb_mm.MatchingEngine(); engine.print_status()"
+
 Running the Standalone C++ Runner
 For profiling and memory testing without Python overhead:
-
-```bash
-
 ./bin/stat_arb_runner
-
-### 📊 Strategy Logic
+```
+## 📊 Strategy Logic
 The core strategy focuses on mean-reversion of the spread between correlated assets, filtered by microstructure signals.
 
 Ingestion: Tick data updates the internal Limit Order Book.
@@ -109,7 +99,7 @@ Filter: Trade execution is gated by OFI (Order Flow Imbalance). Enter trades onl
 
 Execution: Orders are simulated with configurable latency (e.g., 5ms) to model real-world slippage.
 
-### 📜 Disclaimer
+## 📜 Disclaimer
 This software is for educational and research purposes only. Do not use this codebase for live financial trading without extensive testing and risk management protocols.
 
-## ***📬 Contact***
+## 📬 Contact
