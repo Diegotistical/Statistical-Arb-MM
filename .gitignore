@@ -1,4 +1,4 @@
-# C++ Build Artifacts
+# --- C++ Build Artifacts ---
 build/
 bin/
 lib/
@@ -8,7 +8,7 @@ lib/
 *.exe
 *.dll
 
-# Python
+# --- Python ---
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
@@ -16,9 +16,18 @@ __pycache__/
 .pytest_cache/
 venv/
 
-# Data
+# --- Data Handling ---
+# Ignore everything in data...
 data/raw/*
 data/processed/*
+
+# ...EXCEPT the .gitkeep files (so folders show on GitHub)
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Keep sample data
 !data/samples/
+
+# --- System ---
 .env
 .DS_Store
