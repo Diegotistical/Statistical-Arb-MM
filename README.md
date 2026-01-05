@@ -304,20 +304,58 @@ notebooks/
 
 ---
 
-## What This Is Not
+## Limitations & Caveats
 
-- **Not a production trading system** — no networking, no FIX, no risk controls
-- **Not multi-threaded** — designed for single-symbol, single-core (shard model)
-- **Not exchange-connected** — simulation only
+> **This is a research/educational simulator, not a production trading system.**
+
+### Performance Numbers
+
+| Claim                     | Reality                                                                                                                                                              |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 16M ops/sec, 61ns latency | **In-memory engine benchmark**, no networking, no serialization, no I/O. Real-world latency includes network (~10-50µs), feed parsing (~500ns), and kernel overhead. |
+| "Competitive with NASDAQ" | NASDAQ has dedicated hardware, kernel bypass (DPDK/RDMA), and decades of optimization. This is a single-threaded CPU simulation.                                     |
+
+### Strategy Simplifications
+
+| Claim                             | Reality                                                                                                                       |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| "30% adverse selection reduction" | Measured in simulation. Real OFI signals are noisier, and the threshold (0.3) is arbitrary — needs calibration per asset.     |
+| "Half-life from OU fit"           | Assumes cointegration is stable. Real pairs break down (regime changes), and half-life estimation has significant error bars. |
+| "Z-score > 2 = trade"             | Classic stat-arb entry. In practice, transaction costs, slippage, and capacity constraints erode much of this edge.           |
+
+### Execution Model
+
+| Claim                   | Reality                                                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Queue position modeling | Toy-level. Real exchange queues have hidden orders, iceberg orders, priority rules, and queue-jumping via cancel/replace. |
+| Latency + jitter        | Fixed 5µs ± 1µs is optimistic. Real latency is non-Gaussian with fat tails (outliers to 100µs+).                          |
+| Partial fills           | Assumes pro-rata. Real exchanges use price-time priority, size priority, or hybrid rules.                                 |
+
+### Market Frictions Not Modeled
+
+- **Exchange fees** (~$0.003/share maker, ~$0.003/share taker)
+- **Market impact** (your orders move the price)
+- **Funding costs** (borrowing shares for shorts)
+- **Regulatory constraints** (locate requirements, circuit breakers)
+- **Operational risk** (system failures, fat-finger errors)
+
+### What This Actually Is
+
+| ✅ Good For                    | ❌ Not Good For                  |
+| ------------------------------ | -------------------------------- |
+| Learning market microstructure | Predicting real trading PnL      |
+| Prototyping strategy logic     | Backtesting with realistic fills |
+| Understanding HFT engineering  | Deploying to production          |
+| Interview preparation          | Actual trading                   |
 
 ---
 
 ## What This Demonstrates
 
 1. **Systems Engineering**: Cache-aware data structures, zero-allocation hot paths, SIMD
-2. **Microstructure**: OFI, adverse selection, queue position modeling
+2. **Microstructure Concepts**: OFI, adverse selection, queue position (simplified)
 3. **Statistics**: Cointegration, Ornstein-Uhlenbeck, half-life estimation
-4. **Strategy**: Avellaneda-Stoikov market making with inventory control
+4. **Strategy Logic**: Avellaneda-Stoikov market making with inventory control
 5. **Research Workflow**: C++ engine + Python bindings + Jupyter notebooks
 
 ---
