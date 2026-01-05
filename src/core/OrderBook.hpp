@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <memory_resource>
+#include <utility>
 #include <vector>
 
 #include "Bitset.hpp"
@@ -273,6 +274,36 @@ public:
         static const OrderLocation invalid{};
         if (orderId >= MAX_ORDER_ID) return invalid;
         return idToLocation_[orderId];
+    }
+
+    /**
+     * @brief Get queue position for an order.
+     * 
+     * @param orderId Order ID to query
+     * @return Shares and orders ahead in queue
+     */
+    [[nodiscard]] std::pair<Quantity, int32_t> getQueuePosition(OrderId orderId) const noexcept {
+        if (orderId >= MAX_ORDER_ID) return {0, -1};
+        
+        const auto& loc = idToLocation_[orderId];
+        if (loc.generation != generation_ || loc.price == PRICE_INVALID) {
+            return {0, -1};
+        }
+        
+        const auto& levels = (loc.side == OrderSide::Buy) ? bids_ : asks_;
+        const auto& level = levels[loc.price];
+        
+        Quantity sharesAhead = 0;
+        int32_t ordersAhead = 0;
+        
+        for (size_t i = level.headIndex; i < static_cast<size_t>(loc.index); ++i) {
+            if (level.orders[i].isActive()) {
+                sharesAhead += level.orders[i].quantity;
+                ordersAhead++;
+            }
+        }
+        
+        return {sharesAhead, ordersAhead};
     }
 
 private:

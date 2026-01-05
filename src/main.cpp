@@ -1,187 +1,193 @@
 /**
  * @file main.cpp
- * @brief Demo of single stock equity order matching engine.
+ * @brief Statistical Arbitrage Market Making Simulator Demo.
  * 
  * Demonstrates:
- *   - Tick normalization (USD -> ticks)
- *   - Order book operations
- *   - Price-time priority matching
- *   - Self-trade prevention
- *   - IOC/FOK orders
- *   - Latency measurement
+ *   - Multi-asset order book
+ *   - Spread z-score computation
+ *   - OFI (Order Flow Imbalance)
+ *   - Avellaneda-Stoikov market making
+ *   - Backtest simulation
  */
 
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <vector>
 
 #include "core/OrderBook.hpp"
 #include "core/MatchingStrategy.hpp"
 #include "core/TickNormalizer.hpp"
+#include "core/Timestamp.hpp"
+#include "signals/SpreadModel.hpp"
+#include "signals/OFI.hpp"
+#include "strategy/StatArbMM.hpp"
+#include "execution/ExecutionSimulator.hpp"
 
 using Clock = std::chrono::high_resolution_clock;
 
 // ============================================================================
-// Demo: Single Stock Equity Matching
+// Demo: Stat-Arb Market Making
 // ============================================================================
 
-void demoEquityMatching() {
-    std::cout << "\n=== Single Stock Equity Matching Demo ===\n\n";
+void demoStatArbMM() {
+    std::cout << "\n=== Statistical Arbitrage Market Making Demo ===\n\n";
     
-    // Create order book and matching strategy
+    // Setup
+    TickNormalizer ticks(0.01);  // $0.01 tick
+    signals::SpreadModel spreadModel(100, 1.0);  // 100-tick lookback
+    signals::OFI ofi(100);
+    strategy::StatArbMM mm;
+    
+    std::mt19937_64 rng(42);
+    std::normal_distribution<> priceDist(0, 0.02);
+    std::normal_distribution<> spreadDist(0, 0.01);
+    
+    // Simulate two cointegrated assets
+    double priceA = 150.0;
+    double priceB = 150.0;
+    double spreadState = 0;
+    
+    std::cout << "Simulating 1000 ticks of cointegrated pair trading...\n\n";
+    
+    // Metrics
+    int trades = 0;
+    double totalZ = 0;
+    
+    for (int t = 0; t < 1000; ++t) {
+        // Evolve prices (cointegrated with mean-reverting spread)
+        priceA *= std::exp(priceDist(rng));
+        spreadState = 0.9 * spreadState + spreadDist(rng);  // OU process
+        priceB = priceA * std::exp(spreadState);
+        
+        // Update signals
+        double z = spreadModel.update(priceA, priceB);
+        totalZ += std::abs(z);
+        
+        // Simulate book sizes
+        double bidSize = 1000 + 500 * spreadState;
+        double askSize = 1000 - 500 * spreadState;
+        ofi.update(bidSize, askSize);
+        
+        // Generate quotes
+        double fairPrice = ticks.toTicks((priceA + priceB) / 2.0);
+        double vol = spreadModel.stdDev() * 100;  // Scale for ticks
+        
+        strategy::Quote quote = mm.computeQuotes(fairPrice, vol, z, ofi.normalized());
+        
+        // Log every 200 ticks
+        if (t % 200 == 0) {
+            std::cout << "Tick " << std::setw(4) << t 
+                      << " | A=$" << std::fixed << std::setprecision(2) << priceA
+                      << " B=$" << priceB
+                      << " | z=" << std::setprecision(3) << std::setw(6) << z
+                      << " | OFI=" << std::setw(6) << ofi.normalized()
+                      << " | Inv=" << std::setw(4) << mm.inventory()
+                      << "\n";
+        }
+        
+        // Simulate random fills
+        if (quote.valid && (rng() % 100 < 10)) {
+            OrderSide side = (rng() % 2 == 0) ? OrderSide::Buy : OrderSide::Sell;
+            mm.onFill(side, 100);
+            trades++;
+        }
+    }
+    
+    std::cout << "\n--- Summary ---\n"
+              << "  Ticks processed: 1000\n"
+              << "  Trades:          " << trades << "\n"
+              << "  Final inventory: " << mm.inventory() << "\n"
+              << "  Avg |z-score|:   " << std::setprecision(3) << totalZ / 1000 << "\n"
+              << "  Spread mean:     " << std::setprecision(6) << spreadModel.mean() << "\n"
+              << "  Spread std:      " << spreadModel.stdDev() << "\n";
+}
+
+// ============================================================================
+// Demo: Execution Simulation
+// ============================================================================
+
+void demoExecutionSim() {
+    std::cout << "\n=== Execution Simulation Demo ===\n\n";
+    
     OrderBook book;
-    StandardMatchingStrategy matcher;
-    std::vector<Trade> trades;
-    
-    // Tick normalizer for AAPL-like stock ($0.01 tick)
+    execution::ExecutionSimulator executor(5000, 1000);  // 5µs + 1µs jitter
     TickNormalizer ticks(0.01);
     
-    std::cout << "Tick size: $" << ticks.tickSize() << "\n\n";
-    
-    // ========================================================================
-    // Step 1: Add resting orders (limit orders on book)
-    // ========================================================================
-    std::cout << "--- Adding Resting Orders ---\n";
-    
-    // Bids (buy orders)
-    OrderId nextId = 0;
-    
-    struct OrderInput { double price; Quantity qty; const char* desc; };
-    OrderInput bids[] = {
-        {150.20, 100, "Client A bid"},
-        {150.19, 200, "Client B bid"},
-        {150.18, 150, "Client C bid"},
-    };
-    
-    for (auto& b : bids) {
-        Order order(nextId++, nextId, 0,
-                    OrderSide::Buy, OrderType::Limit,
-                    ticks.toTicks(b.price), b.qty);
-        book.addOrder(order);
-        std::cout << "  Added: " << b.desc << " @ $" << b.price 
-                  << " x " << b.qty << " (tick=" << order.price << ")\n";
+    // Build initial book
+    for (int i = 0; i < 10; ++i) {
+        Order bid(i, i, 0, OrderSide::Buy, OrderType::Limit,
+                  ticks.toTicks(150.00 - i * 0.01), 100);
+        Order ask(i + 10, i + 10, 0, OrderSide::Sell, OrderType::Limit,
+                  ticks.toTicks(150.10 + i * 0.01), 100);
+        (void)book.addOrder(bid);
+        (void)book.addOrder(ask);
     }
     
-    // Asks (sell orders)
-    OrderInput asks[] = {
-        {150.25, 100, "Client D ask"},
-        {150.26, 200, "Client E ask"},
-        {150.27, 150, "Client F ask"},
-    };
+    std::cout << "Initial book:\n"
+              << "  Best Bid: $" << ticks.toPrice(book.getBestBid()) << "\n"
+              << "  Best Ask: $" << ticks.toPrice(book.getBestAsk()) << "\n\n";
     
-    for (auto& a : asks) {
-        Order order(nextId++, nextId, 0,
-                    OrderSide::Sell, OrderType::Limit,
-                    ticks.toTicks(a.price), a.qty);
-        book.addOrder(order);
-        std::cout << "  Added: " << a.desc << " @ $" << a.price 
-                  << " x " << a.qty << " (tick=" << order.price << ")\n";
+    // Submit aggressive order using Timestamp
+    core::Timestamp t0(0);
+    Order aggressor(100, 100, 0, OrderSide::Buy, OrderType::Limit,
+                    ticks.toTicks(150.10), 50);  // Marketable
+    
+    std::cout << "Submitting marketable buy order...\n";
+    executor.submit(aggressor, t0);
+    
+    // Process after latency
+    core::Timestamp t1(10000);  // 10µs later
+    auto fills = executor.process(book, t1);
+    
+    std::cout << "Fills after " << (t1 - t0) / 1000 << "µs:\n";
+    for (const auto& fill : fills) {
+        std::cout << "  Order " << fill.orderId
+                  << " filled " << fill.fillQty
+                  << " @ $" << ticks.toPrice(fill.fillPrice)
+                  << (fill.complete ? " (complete)" : " (partial)")
+                  << (fill.isMaker ? " [maker]" : " [taker]")
+                  << " AS=" << fill.adverseSelectionCost << "\n";
     }
+}
+
+// ============================================================================
+// Performance Benchmark
+// ============================================================================
+
+void runBenchmark() {
+    std::cout << "\n=== Performance Benchmark ===\n\n";
     
-    std::cout << "\nBook state:\n";
-    std::cout << "  Best Bid: $" << ticks.toPrice(book.getBestBid()) 
-              << " (tick=" << book.getBestBid() << ")\n";
-    std::cout << "  Best Ask: $" << ticks.toPrice(book.getBestAsk()) 
-              << " (tick=" << book.getBestAsk() << ")\n";
-    std::cout << "  Spread:   $" << (ticks.toPrice(book.getBestAsk()) - ticks.toPrice(book.getBestBid())) << "\n";
+    constexpr int NUM_OPS = 1'000'000;
     
-    // ========================================================================
-    // Step 2: Send aggressive order (crosses spread)
-    // ========================================================================
-    std::cout << "\n--- Aggressive Order (Cross Spread) ---\n";
+    signals::SpreadModel spreadModel(100);
+    signals::OFI ofi(100);
     
-    trades.clear();
-    Order aggBuy(nextId++, nextId, 0,
-                 OrderSide::Buy, OrderType::Limit,
-                 ticks.toTicks(150.26), 150);  // Will take best ask + partial second
+    std::mt19937_64 rng(42);
+    std::normal_distribution<> dist(100, 1);
     
-    std::cout << "  Sending: Buy 150 @ $150.26\n";
-    
+    // Benchmark SpreadModel
     auto start = Clock::now();
-    matcher.match(book, aggBuy, trades);
+    for (int i = 0; i < NUM_OPS; ++i) {
+        spreadModel.update(dist(rng), dist(rng));
+    }
     auto end = Clock::now();
     
-    std::cout << "  Matched in " 
-              << std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() 
-              << " ns\n";
-    std::cout << "  Trades generated: " << trades.size() << "\n";
+    double ns_spread = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / static_cast<double>(NUM_OPS);
     
-    for (const auto& t : trades) {
-        std::cout << "    Trade: " << t.quantity << " shares @ $" 
-                  << ticks.toPrice(t.price) << "\n";
-    }
-    
-    std::cout << "\nBook after match:\n";
-    std::cout << "  Best Bid: $" << ticks.toPrice(book.getBestBid()) << "\n";
-    std::cout << "  Best Ask: $" << ticks.toPrice(book.getBestAsk()) << "\n";
-    
-    // ========================================================================
-    // Step 3: IOC Order Demo
-    // ========================================================================
-    std::cout << "\n--- IOC Order Demo ---\n";
-    
-    trades.clear();
-    Order ioc(nextId++, nextId, 0, 0,
-              OrderSide::Buy, OrderType::Limit,
-              TimeInForce::IOC, ticks.toTicks(150.30), 500);
-    
-    std::cout << "  Sending: IOC Buy 500 @ $150.30\n";
-    matcher.match(book, ioc, trades);
-    
-    std::cout << "  Filled: " << (500 - ioc.quantity) << " shares\n";
-    std::cout << "  Cancelled (unfilled): " << (ioc.isActive() ? ioc.quantity : 0) << " shares\n";
-    std::cout << "  Trades: " << trades.size() << "\n";
-    
-    // ========================================================================
-    // Step 4: Self-Trade Prevention Demo
-    // ========================================================================
-    std::cout << "\n--- Self-Trade Prevention Demo ---\n";
-    
-    book.reset();
-    nextId = 0;
-    
-    // Add order from Client ID 100
-    Order restingSell(nextId++, 1, 100, 0,  // clientId = 100
-                      OrderSide::Sell, OrderType::Limit,
-                      TimeInForce::GTC, ticks.toTicks(150.00), 100);
-    book.addOrder(restingSell);
-    std::cout << "  Added: Client 100 sell @ $150.00 x 100\n";
-    
-    // Try to buy from same client
-    trades.clear();
-    Order selfBuy(nextId++, 2, 100, 0,  // clientId = 100 (same!)
-                  OrderSide::Buy, OrderType::Limit,
-                  TimeInForce::GTC, ticks.toTicks(150.00), 100);
-    
-    std::cout << "  Sending: Client 100 buy @ $150.00 x 100 (same client)\n";
-    matcher.match(book, selfBuy, trades);
-    
-    std::cout << "  Trades generated: " << trades.size() << " (STP prevented)\n";
-    std::cout << "  Incoming order active: " << (selfBuy.isActive() ? "yes" : "NO (cancelled by STP)") << "\n";
-    
-    // ========================================================================
-    // Step 5: Latency Summary
-    // ========================================================================
-    std::cout << "\n--- Quick Latency Check ---\n";
-    
-    book.reset();
-    
-    constexpr int NUM_OPS = 100000;
-    
+    // Benchmark OFI
     start = Clock::now();
     for (int i = 0; i < NUM_OPS; ++i) {
-        Order order(i, i, 0, OrderSide::Buy, OrderType::Limit, 5000 + (i % 1000), 100);
-        book.addOrder(order);
+        ofi.update(dist(rng), dist(rng));
     }
     end = Clock::now();
     
-    double ns_per_op = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / static_cast<double>(NUM_OPS);
-    double ops_per_sec = 1e9 / ns_per_op / 1e6;
+    double ns_ofi = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / static_cast<double>(NUM_OPS);
     
-    std::cout << "  " << NUM_OPS << " addOrder ops\n";
-    std::cout << "  Avg latency: " << std::fixed << std::setprecision(1) << ns_per_op << " ns\n";
-    std::cout << "  Throughput:  " << std::setprecision(2) << ops_per_sec << " M ops/sec\n";
+    std::cout << "SpreadModel.update:  " << std::fixed << std::setprecision(1) << ns_spread << " ns/op\n"
+              << "OFI.update:          " << ns_ofi << " ns/op\n"
+              << "Operations:          " << NUM_OPS / 1'000'000 << "M\n";
 }
 
 // ============================================================================
@@ -190,17 +196,17 @@ void demoEquityMatching() {
 
 int main() {
     std::cout << "========================================\n";
-    std::cout << "   Single Stock Equity Matching Engine\n";
+    std::cout << "  Stat-Arb Market Making Simulator\n";
     std::cout << "========================================\n";
     std::cout << "Order size:    " << sizeof(Order) << " bytes\n";
     std::cout << "Max orders:    " << OrderBook::MAX_ORDER_ID << "\n";
-    std::cout << "Max price:     " << OrderBook::MAX_PRICE << " ticks\n";
-    std::cout << "POD verified:  " << (std::is_trivially_copyable_v<Order> ? "YES" : "NO") << "\n";
     
-    demoEquityMatching();
+    demoStatArbMM();
+    demoExecutionSim();
+    runBenchmark();
     
     std::cout << "\n========================================\n";
-    std::cout << "   Demo Complete\n";
+    std::cout << "  Demo Complete\n";
     std::cout << "========================================\n";
     
     return 0;

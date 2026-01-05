@@ -101,6 +101,21 @@ target_link_libraries(latency_tests PRIVATE Threads::Threads)
 target_link_libraries(orderbook_bench PRIVATE Threads::Threads)
 
 # ============================================================================
+# Target: Replay Tests
+# ============================================================================
+
+add_executable(replay_tests
+    tests/cpp/replay_tests.cpp
+    ${CORE_SOURCES}
+)
+
+set_target_properties(replay_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin"
+)
+
+target_link_libraries(replay_tests PRIVATE Threads::Threads)
+
+# ============================================================================
 # Python Bindings (Optional)
 # ============================================================================
 
