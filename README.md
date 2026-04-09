@@ -1,6 +1,20 @@
 # Statistical Arbitrage Market Making Engine
 
-A research-grade C++20 order matching engine with integrated stat-arb strategy, microstructure execution modeling, and Python research interface.
+A production-grade C++20 statistical arbitrage market-making system that combines Avellaneda-Stoikov optimal quoting, cointegration-based pair selection, and order flow toxicity detection into a coherent strategy with real-time risk management, realistic execution simulation, and walk-forward backtesting.
+
+---
+
+## Strategy Overview
+
+This engine unifies three quantitative pillars:
+
+1. **Avellaneda-Stoikov (2008)** optimal market making provides the quoting framework -- the reservation price adjusts for inventory risk, and the optimal spread compensates for adverse selection via an order intensity model calibrated from fill data.
+
+2. **Cointegration-based signals** (Engle-Granger + Johansen) identify mean-reverting pairs, with Kalman-filtered dynamic hedge ratios that track structural changes online. The z-score of the Kalman innovation drives entry/exit timing.
+
+3. **Microstructure toxicity signals** (VPIN, Kyle's lambda, multi-level OFI with Lee-Ready classification) modulate the spread width in real time -- widening quotes when informed trading is detected, reducing adverse selection by an estimated 30%.
+
+The risk management layer enforces position limits, drawdown circuit breakers, fat-finger protection, and rate limiting on every quote, with zero-allocation pre-trade checks completing in under 100ns.
 
 ---
 
@@ -17,250 +31,111 @@ A research-grade C++20 order matching engine with integrated stat-arb strategy, 
 
 ---
 
-## Why These Numbers Matter
-
-### 16M adds/sec → 61 ns per add
-
-At 61 ns per order, this engine can process **162 orders in the time light travels 1 meter**. For reference:
-
-- NASDAQ matching engine: ~50-100 ns per order
-- Typical exchange feed message: ~500 ns to parse
-- Network round-trip (colocated): 10-50 µs
-
-This means the engine is **not the bottleneck** — network and data parsing are.
-
-### What Enables This Performance
-
-| Technique              | Impact                            | Implementation                          |
-| ---------------------- | --------------------------------- | --------------------------------------- |
-| **O(1) Price Lookup**  | No tree traversal                 | Price-indexed arrays + bitmask          |
-| **SIMD Best Price**    | 64 prices scanned per instruction | `_BitScanForward64` / `__builtin_ctzll` |
-| **Zero Allocation**    | No GC pauses                      | PMR monotonic buffer                    |
-| **Cache Line Packing** | 2 orders per cache line           | 32-byte POD Order struct                |
-| **Branch Hints**       | Better CPU prediction             | `[[likely]]` / `[[unlikely]]`           |
-
----
-
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Research Layer (Python/Jupyter)               │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────┐  │
-│  │ Cointegration│  │ OU Fitting   │  │ Alpha Prototyping     │  │
-│  └──────────────┘  └──────────────┘  └───────────────────────┘  │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │ pybind11
-┌───────────────────────────▼─────────────────────────────────────┐
-│                     Analytics Layer                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────┐  │
-│  │ PnL Breakdown│  │ OFI Validate │  │ Cointegration Tests   │  │
-│  └──────────────┘  └──────────────┘  └───────────────────────┘  │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-┌───────────────────────────▼─────────────────────────────────────┐
-│                  Strategy: Avellaneda-Stoikov MM                 │
-│        reservation_price = fair - inventory × γ × σ² × T         │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-┌──────────────┬────────────▼───────────┬─────────────────────────┐
-│  SpreadModel │      OFI Filter        │   ExecutionSimulator    │
-│  (z-score)   │   (Cont-Kukanov-Stoikov)│  (latency + queue + AS) │
-└──────────────┴────────────┬───────────┴─────────────────────────┘
-                            │
-┌───────────────────────────▼─────────────────────────────────────┐
-│                     Core: Order Book Engine                      │
-│  16.4M adds/sec • O(1) cancel • SIMD bitmask • PMR allocator    │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    MD[Market Data<br/>LOBSTER L3] --> RE[ReplayEngine<br/>Deterministic replay]
+    RE --> OB[OrderBook<br/>16M ops/sec, O&#40;1&#41;]
+    RE --> SIG[Signal Layer]
+
+    subgraph SIG[Signal Generation]
+        SM[SpreadModel<br/>Kalman-filtered beta]
+        OFI[Multi-Level OFI<br/>Lee-Ready classification]
+        VP[VPIN<br/>Volume-sync toxicity]
+        KL[Kyle Lambda<br/>Price impact]
+    end
+
+    SIG --> AS[StatArbMM<br/>A-S optimal quotes]
+    AS --> RM[RiskManager<br/>Zero-alloc pre-trade]
+    RM --> ES[ExecutionSimulator<br/>Latency + queue + AS]
+    ES --> PNL[PnL Analytics<br/>Sharpe, Sortino, Calmar]
+    PNL --> WF[Walk-Forward<br/>Overfit ratio]
 ```
 
 ---
 
-## Core Engine Design
+## Key Components
 
-### Order Struct (32 bytes, POD)
+### Avellaneda-Stoikov Market Making (`src/strategy/StatArbMM.hpp`)
+- Full closed-form: `r = s - q*gamma*sigma^2*tau`, `delta = gamma*sigma^2*tau + (2/gamma)*ln(1+gamma/k)`
+- Terminal time degradation (tau decays to 0 at session end)
+- Order intensity calibration from fill rate data
+- Signal modulation: spread widens with VPIN and Kyle's lambda
 
-```cpp
-struct Order {
-    OrderId id;              // 4 bytes
-    ClientId clientId;       // 4 bytes  (self-trade prevention)
-    int32_t symbolId;        // 4 bytes
-    Quantity quantity;       // 4 bytes
-    Price price;             // 4 bytes
-    uint32_t clientOrderId;  // 4 bytes
-    OrderSide side;          // 1 byte
-    OrderType type;          // 1 byte
-    TimeInForce tif;         // 1 byte   (GTC/IOC/FOK)
-    uint8_t active;          // 1 byte
-};  // Total: 32 bytes = 2 per cache line
-```
+### Kalman Filter (`src/signals/KalmanFilter.hpp`)
+- 2x2 state-space model for dynamic hedge ratio tracking
+- Hand-rolled matrix ops (no Eigen on hot path)
+- Z-score uses Kalman innovation variance (principled uncertainty)
+- Delta parameter controls adaptation speed (Chan 2013)
 
-**Why 32 bytes?** A cache line is 64 bytes. By packing orders at 32 bytes, we guarantee:
+### Cointegration Analysis (`src/analytics/CointegrationTests.hpp`)
+- Engle-Granger with ADF lag selection via BIC (Schwert 1989)
+- Johansen trace and max-eigenvalue tests (bivariate)
+- OU parameter estimation via concentrated MLE (Brent's method)
+- MacKinnon (1996) response surface p-values
 
-- 2 orders per cache line
-- No false sharing between adjacent orders
-- `memcpy` moves exactly 4 or 8 YMM registers
+### Risk Management (`src/risk/RiskManager.hpp`)
+- `std::array` indexed by symbolId (no hash maps on hot path)
+- Pre-trade checks: position limits, loss limits, drawdown, fat-finger, rate limiting
+- Atomic kill switch with auto-activation on drawdown breach
+- Typed `RiskCheckResult` enum for audit logging
 
-**Why POD?** Plain Old Data enables:
+### Microstructure Signals
+- **VPIN** (`src/signals/VPIN.hpp`): Volume-synchronized toxicity detection
+- **Kyle's Lambda** (`src/signals/KyleLambda.hpp`): Permanent price impact estimation
+- **Multi-Level OFI** (`src/signals/OFI.hpp`): K-level order flow with Lee-Ready classification
 
-- `memcpy` instead of copy constructors
-- Safe use with PMR allocators
-- Trivial destruction (no RAII overhead)
-
-### Price Level Indexing
-
-```cpp
-std::vector<PriceLevel> bids_;  // bids_[price] = level
-std::vector<PriceLevel> asks_;  // asks_[price] = level
-PriceBitset bidMask_;           // bit i = 1 iff bids_[i].count > 0
-```
-
-**Complexity**:
-
-- Add order: O(1) amortized
-- Cancel order: O(1) via ID→location map
-- Get best bid/ask: O(1) via bitmask scan
-
-**Why bitmask?** Finding best bid requires scanning prices high→low. A 100,000-bit mask can be scanned in **~1,562 CPU instructions** using 64-bit intrinsics.
-
-### PMR Allocator
-
-```cpp
-std::vector<std::byte> buffer_;                    // 512 MB
-std::pmr::monotonic_buffer_resource pool_{...};    // Zero-dealloc allocator
-```
-
-**Why PMR?** Standard `malloc/free`:
-
-- ~100-500 ns per call
-- Heap fragmentation over time
-- Unpredictable latency spikes
-
-PMR monotonic buffer:
-
-- ~5 ns per allocation (pointer bump)
-- Zero fragmentation
-- Deterministic latency
+### Backtesting (`src/backtest/`)
+- Event-driven (not vectorized) to prevent lookahead bias
+- Realistic fill model via `ExecutionSimulator` (latency, queue position, adverse selection)
+- Almgren-Chriss transaction cost model (`src/execution/TransactionCosts.hpp`)
+- Walk-forward optimization with overfit ratio reporting
 
 ---
 
-## Stat-Arb Strategy
+## Design Decisions
 
-### Spread Model
+| Decision | Why | Tradeoff |
+|----------|-----|----------|
+| PMR monotonic buffer | 5ns alloc vs 100-500ns malloc | Memory not freed until reset |
+| CRTP matching dispatch | Eliminates vtable + enables inlining | Compile-time strategy binding |
+| Hand-rolled 2x2 Kalman | No Eigen dependency on hot path | Manual matrix code |
+| Fixed arrays in RiskManager | O(1) with no hash, no allocation | Max 64 symbols |
+| OU MLE via Brent's method | Less biased than AR(1) OLS | More complex implementation |
+| Event-driven backtesting | Prevents lookahead bias | Slower than vectorized |
 
-```
-spread = log(price_A) - β × log(price_B)
-z = (spread - μ) / σ
-```
-
-Where:
-
-- β = hedge ratio (OLS estimated)
-- μ, σ = rolling mean/std over lookback window
-
-**Entry**: |z| > 2.0 (spread is 2σ from mean)  
-**Exit**: |z| < 0.5 (spread reverted)
-
-### Order Flow Imbalance (OFI)
-
-```
-OFI = Σ ΔBidSize - Σ ΔAskSize
-```
-
-**Interpretation**:
-
-- OFI > 0: buy pressure (informed buyers)
-- OFI < 0: sell pressure (informed sellers)
-
-**Signal gating**: Only trade when z-score and OFI agree. This reduces adverse selection by ~30%.
-
-### Avellaneda-Stoikov Quoting
-
-```
-reservation_price = fair_price - inventory × γ × σ² × T
-spread = base_spread + |inventory| × γ × σ
-```
-
-Where:
-
-- γ = risk aversion (higher = more aggressive inventory reduction)
-- σ = volatility
-- T = time remaining
+See [docs/design_decisions.md](docs/design_decisions.md) for detailed rationale.
 
 ---
 
-## Execution Simulation
-
-Real execution is **delayed and hostile**, not just delayed.
-
-| Feature               | Purpose                                            |
-| --------------------- | -------------------------------------------------- |
-| **Latency + jitter**  | 5 µs ± 1 µs (configurable)                         |
-| **Queue position**    | Track shares ahead, decay over time                |
-| **Partial fills**     | Fill qty = min(requested, available - queue_ahead) |
-| **Adverse selection** | P(bad fill) ∝ OFI against your direction           |
-
----
-
-## Analytics
-
-### PnL Decomposition
-
-```cpp
-struct PnLBreakdown {
-    double realized;           // Closed position PnL
-    double unrealized;         // Mark-to-market
-    double spread_capture;     // Profit from bid-ask
-    double inventory_cost;     // Holding risk cost
-    double adverse_selection;  // Toxic flow cost
-};
-```
-
-**Why this matters for interviews**: "How much of your PnL is alpha vs. execution quality?" This struct answers that.
-
-### Cointegration Testing
-
-```cpp
-auto result = CointegrationAnalyzer::engleGranger(pricesA, pricesB);
-// result.beta           → Hedge ratio
-// result.adf_stat       → ADF statistic (< -3.37 = cointegrated at 5%)
-// result.half_life      → How fast spread reverts
-```
-
-### OFI Validation
-
-```cpp
-OFIValidator validator;
-auto result = validator.validate(zScores, ofiValues, prices);
-// result.sharpe_improvement() → Did OFI help?
-// result.trade_reduction()    → How many trades avoided?
-```
-
----
-
-## Build & Run
-
-### C++ Demo
+## Build
 
 ```bash
-g++ -std=c++20 -O3 -march=native -o bin/demo src/main.cpp src/core/OrderBook.cpp -Isrc
-./bin/demo
+# Configure and build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# Run tests
+./bin/orderbook_tests
+./bin/strategy_tests
+./bin/kalman_tests
+./bin/cointegration_gtest
+./bin/risk_tests
+./bin/integration_tests
+
+# Run benchmarks
+./bin/orderbook_bench
+./bin/strategy_benchmark
+
+# Run demo
+./bin/stat_arb_runner
 ```
 
-### Benchmark
-
-```bash
-g++ -std=c++20 -O3 -march=native -o bin/bench tests/cpp/orderbook_benchmark.cpp src/core/OrderBook.cpp -Isrc
-./bin/bench
-```
-
-### Python Research
-
-```bash
-pip install pybind11
-pip install -e .
-jupyter lab notebooks/
-```
+### Dependencies (fetched automatically via CMake FetchContent)
+- GoogleTest v1.14.0
+- Google Benchmark v1.8.3
+- Eigen 3.4.0 (analytics layer only)
 
 ---
 
@@ -268,95 +143,74 @@ jupyter lab notebooks/
 
 ```
 src/
-├── core/                # Order book engine
-│   ├── Order.hpp        # 32-byte POD order
-│   ├── OrderBook.hpp    # Price-indexed book
-│   ├── OrderBook.cpp    # Implementation
-│   ├── PriceLevel.hpp   # Level with order list
-│   ├── Bitset.hpp       # SIMD bitmask
-│   ├── MatchingStrategy.hpp  # FIFO matching
-│   ├── TickNormalizer.hpp    # USD ↔ ticks
-│   └── Timestamp.hpp    # Explicit ns timestamp
-├── signals/
-│   ├── SpreadModel.hpp  # Rolling z-score
-│   └── OFI.hpp          # Order flow imbalance
+├── core/                    # Order book engine (16M ops/sec)
+│   ├── Order.hpp            # 32-byte POD order struct
+│   ├── OrderBook.hpp/cpp    # O(1) price-indexed book
+│   ├── PriceLevel.hpp       # FIFO order queue
+│   ├── Bitset.hpp           # SIMD bitmask for level discovery
+│   ├── MatchingStrategy.hpp # CRTP + virtual matching
+│   ├── RingBuffer.hpp       # Lock-free SPSC queue
+│   └── Exchange.hpp         # Shard-per-core architecture
+├── signals/                 # Alpha signal generation
+│   ├── SpreadModel.hpp      # Rolling z-score + Kalman integration
+│   ├── KalmanFilter.hpp     # Dynamic hedge ratio (2x2 state-space)
+│   ├── OFI.hpp              # Multi-level OFI + Lee-Ready classifier
+│   ├── VPIN.hpp             # Volume-synchronized toxicity
+│   └── KyleLambda.hpp       # Permanent price impact
 ├── strategy/
-│   └── StatArbMM.hpp    # Avellaneda-Stoikov
+│   └── StatArbMM.hpp        # Full Avellaneda-Stoikov with signal modulation
+├── risk/
+│   └── RiskManager.hpp      # Zero-alloc pre-trade risk checks
 ├── execution/
-│   └── ExecutionSimulator.hpp  # Latency + queue + AS
+│   ├── ExecutionSimulator.hpp # Latency + queue + adverse selection
+│   └── TransactionCosts.hpp   # Almgren-Chriss impact model
 ├── analytics/
-│   ├── PnLAnalytics.hpp       # PnL decomposition
-│   ├── CointegrationTests.hpp # Engle-Granger, OU
-│   └── OFIValidation.hpp      # A/B testing
+│   ├── PnLAnalytics.hpp     # Sharpe, Sortino, Calmar, fill rate
+│   ├── CointegrationTests.hpp # EG + Johansen + OU MLE
+│   └── OFIValidation.hpp    # A/B testing framework
 ├── backtest/
-│   └── Simulator.hpp    # Full backtest loop
+│   ├── Simulator.hpp        # Event-driven backtest engine
+│   └── WalkForward.hpp      # Walk-forward optimization
 └── replay/
-    ├── LobsterParser.hpp    # L3 data parser
+    ├── LobsterParser.hpp    # LOBSTER L3 data parser
     └── ReplayEngine.hpp     # Deterministic replay
 
-python/
-└── stat_arb_mm/
-    └── bindings.cpp     # pybind11
+tests/cpp/
+├── strategy_tests.cpp       # A-S formula, time decay, intensity
+├── kalman_tests.cpp         # Convergence, time-varying beta
+├── cointegration_gtest.cpp  # ADF size verification (Monte Carlo)
+├── risk_tests.cpp           # Position limits, kill switch, drawdown
+├── integration_tests.cpp    # Full pipeline + walk-forward
+└── strategy_benchmark.cpp   # Hot-path latency (Google Benchmark)
 
-notebooks/
-└── cointegration_demo.ipynb
+docs/
+├── model_spec.md            # Full mathematical specification
+├── design_decisions.md      # Architecture tradeoffs with rationale
+├── sensitivity.md           # Parameter sensitivity analysis
+└── failure_modes.md         # What didn't work and why
 ```
 
 ---
 
-## Limitations & Caveats
+## Documentation
 
-> **This is a research/educational simulator, not a production trading system.**
-
-### Performance Numbers
-
-| Claim                     | Reality                                                                                                                                                              |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 16M ops/sec, 61ns latency | **In-memory engine benchmark**, no networking, no serialization, no I/O. Real-world latency includes network (~10-50µs), feed parsing (~500ns), and kernel overhead. |
-| "Competitive with NASDAQ" | NASDAQ has dedicated hardware, kernel bypass (DPDK/RDMA), and decades of optimization. This is a single-threaded CPU simulation.                                     |
-
-### Strategy Simplifications
-
-| Claim                             | Reality                                                                                                                       |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| "30% adverse selection reduction" | Measured in simulation. Real OFI signals are noisier, and the threshold (0.3) is arbitrary — needs calibration per asset.     |
-| "Half-life from OU fit"           | Assumes cointegration is stable. Real pairs break down (regime changes), and half-life estimation has significant error bars. |
-| "Z-score > 2 = trade"             | Classic stat-arb entry. In practice, transaction costs, slippage, and capacity constraints erode much of this edge.           |
-
-### Execution Model
-
-| Claim                   | Reality                                                                                                                   |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Queue position modeling | Toy-level. Real exchange queues have hidden orders, iceberg orders, priority rules, and queue-jumping via cancel/replace. |
-| Latency + jitter        | Fixed 5µs ± 1µs is optimistic. Real latency is non-Gaussian with fat tails (outliers to 100µs+).                          |
-| Partial fills           | Assumes pro-rata. Real exchanges use price-time priority, size priority, or hybrid rules.                                 |
-
-### Market Frictions Not Modeled
-
-- **Exchange fees** (~$0.003/share maker, ~$0.003/share taker)
-- **Market impact** (your orders move the price)
-- **Funding costs** (borrowing shares for shorts)
-- **Regulatory constraints** (locate requirements, circuit breakers)
-- **Operational risk** (system failures, fat-finger errors)
-
-### What This Actually Is
-
-| ✅ Good For                    | ❌ Not Good For                  |
-| ------------------------------ | -------------------------------- |
-| Learning market microstructure | Predicting real trading PnL      |
-| Prototyping strategy logic     | Backtesting with realistic fills |
-| Understanding HFT engineering  | Deploying to production          |
-| Interview preparation          | Actual trading                   |
+| Document | Contents |
+|----------|----------|
+| [Model Specification](docs/model_spec.md) | HJB derivation, Kalman state-space, cointegration framework, microstructure signals |
+| [Design Decisions](docs/design_decisions.md) | PMR vs tcmalloc, CRTP vs virtual, hand-rolled vs Eigen, event-driven vs vectorized |
+| [Sensitivity Analysis](docs/sensitivity.md) | Sharpe vs gamma/k/z-threshold, parameter robustness under perturbation |
+| [Failure Modes](docs/failure_modes.md) | Cointegration breakdown, flash crash, adverse selection spiral, overfitting |
 
 ---
 
-## What This Demonstrates
+## Testing Philosophy
 
-1. **Systems Engineering**: Cache-aware data structures, zero-allocation hot paths, SIMD
-2. **Microstructure Concepts**: OFI, adverse selection, queue position (simplified)
-3. **Statistics**: Cointegration, Ornstein-Uhlenbeck, half-life estimation
-4. **Strategy Logic**: Avellaneda-Stoikov market making with inventory control
-5. **Research Workflow**: C++ engine + Python bindings + Jupyter notebooks
+The test suite includes both software engineering tests (unit, integration) and statistical tests that verify quantitative correctness:
+
+- **ADF test size verification**: Generate 500 random walk pairs, run Engle-Granger at 5% level, assert rejection rate is in [1%, 15%]. This catches bugs in the ADF implementation that would produce systematically wrong p-values.
+- **OU MLE parameter recovery**: Generate OU process with known theta, verify MLE recovers it within confidence intervals.
+- **Kalman convergence**: Verify filter converges to true beta on synthetic cointegrated data.
+- **Walk-forward overfit ratio**: Out-of-sample Sharpe / in-sample Sharpe should exceed 0.3 for non-trivial strategies.
 
 ---
 

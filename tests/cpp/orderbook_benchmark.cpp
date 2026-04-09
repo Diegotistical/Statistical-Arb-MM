@@ -16,8 +16,8 @@
 #include <random>
 #include <vector>
 
-#include "../src/core/OrderBook.hpp"
-#include "../src/core/MatchingStrategy.hpp"
+#include "../../src/core/OrderBook.hpp"
+#include "../../src/core/MatchingStrategy.hpp"
 
 // ============================================================================
 // Configuration

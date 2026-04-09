@@ -1,22 +1,42 @@
 #pragma once
 /**
  * @file StatArbMM.hpp
- * @brief Avellaneda-Stoikov market making strategy.
- * 
- * Computes reservation price and optimal quotes based on:
- *   - Inventory position
- *   - Spread signal (z-score)
- *   - Order flow imbalance
- * 
- * Reference: Avellaneda & Stoikov (2008)
+ * @brief Avellaneda-Stoikov optimal market making with full HJB solution.
+ *
+ * Implements the complete Avellaneda-Stoikov (2008) model:
+ *
+ *   Reservation price:  r(s,q,t) = s - q * gamma * sigma^2 * (T - t)
+ *   Optimal spread:     delta(t) = gamma * sigma^2 * (T - t) + (2/gamma) * ln(1 + gamma/k)
+ *
+ * Where:
+ *   s     = current mid-price (fair value estimate)
+ *   q     = inventory position (signed)
+ *   gamma = risk aversion parameter (higher = more aggressive inventory reduction)
+ *   sigma = asset volatility
+ *   T-t   = time remaining in trading session (fraction, decays to 0)
+ *   k     = order intensity parameter from lambda(delta) = A * exp(-k * delta)
+ *
+ * The key insight: as T-t -> 0 (approaching session end), the reservation
+ * price aggressively pushes toward flattening inventory, and the spread
+ * narrows to attract fills. This terminal behavior is critical and was
+ * missing from the simplified version.
+ *
+ * Signal modulation:
+ *   delta_adj = delta_base * (1 + alpha_vpin * VPIN + alpha_lambda * KyleLambda)
+ *   When toxicity (VPIN) or price impact (Kyle's lambda) is elevated,
+ *   the spread widens to protect against adverse selection.
+ *
+ * Reference: Avellaneda & Stoikov (2008) "High-frequency trading in a
+ * limit order book"
  */
 
 #include <cmath>
 #include <algorithm>
+#include <numbers>
+#include <vector>
 
 #include "../core/Order.hpp"
-#include "../signals/SpreadModel.hpp"
-#include "../signals/OFI.hpp"
+#include "../risk/RiskManager.hpp"
 
 namespace strategy {
 
@@ -29,21 +49,28 @@ struct Quote {
     Quantity bidSize = 0;
     Quantity askSize = 0;
     bool valid = false;
+    risk::RiskCheckResult riskCheck = risk::RiskCheckResult::Passed;
 };
 
 /**
- * @brief Avellaneda-Stoikov stat-arb market maker.
- * 
+ * @brief Avellaneda-Stoikov optimal market maker.
+ *
  * Features:
- *   - Inventory-adjusted reservation price
- *   - Signal gating (z-score + OFI)
- *   - Configurable risk parameters
- * 
+ *   - Full closed-form reservation price with terminal time degradation
+ *   - Optimal spread with order intensity parameter
+ *   - Microstructure signal modulation (VPIN, Kyle's lambda)
+ *   - Risk management integration (pre-trade checks)
+ *   - Inventory-dependent quote sizing
+ *
  * Usage:
  * @code
  *   StatArbMM mm;
- *   mm.setInventory(100);  // Long 100 shares
- *   Quote q = mm.computeQuotes(fairPrice, volatility);
+ *   mm.setSessionTimes(startNs, endNs);
+ *   mm.setInventory(100);
+ *
+ *   // On each tick:
+ *   mm.updateTime(currentNs);
+ *   Quote q = mm.computeQuotes(fairPrice, volatility, zScore, ofi, vpin, kyleLambda);
  * @endcode
  */
 class StatArbMM {
@@ -51,97 +78,221 @@ public:
     // ========================================================================
     // Configuration
     // ========================================================================
-    
-    /** Risk aversion parameter (higher = more aggressive inventory reduction) */
+
+    /** Risk aversion parameter (higher = more aggressive inventory reduction).
+     *  Typical range: 0.001 to 0.1. Controls how much the reservation price
+     *  is adjusted for inventory exposure. */
     double gamma = 0.01;
-    
-    /** Time horizon (fraction of day remaining) */
-    double T = 1.0;
-    
-    /** Base spread (ticks) */
-    double baseSpread = 2.0;
-    
+
+    /** Order arrival intensity parameter k from lambda(delta) = A*exp(-k*delta).
+     *  Estimated from historical fill rates at different spread widths.
+     *  Higher k = fills are more sensitive to spread width. Typical: 0.5 to 5.0 */
+    double k = 1.5;
+
+    /** Base spread in ticks (floor, used when model spread is too narrow) */
+    double minSpread = 1.0;
+
     /** Default quote size */
     Quantity defaultSize = 100;
-    
-    /** Z-score entry threshold */
+
+    /** Z-score entry threshold for directional signal */
     double zEntryThreshold = 1.5;
-    
+
     /** Z-score exit threshold */
     double zExitThreshold = 0.5;
-    
+
     /** OFI threshold for signal confirmation */
     double ofiThreshold = 0.3;
-    
+
     /** Maximum inventory (absolute) */
     int32_t maxInventory = 1000;
+
+    /** VPIN sensitivity for spread modulation. Typical: 0.5 to 2.0 */
+    double alphaVpin = 1.0;
+
+    /** Kyle's lambda sensitivity for spread modulation. Typical: 0.5 to 2.0 */
+    double alphaLambda = 0.5;
+
+    // ========================================================================
+    // Session Time Management
+    // ========================================================================
+
+    /**
+     * @brief Set trading session boundaries.
+     * @param startNs Session start time (nanoseconds since epoch)
+     * @param endNs   Session end time (nanoseconds since epoch)
+     */
+    void setSessionTimes(int64_t startNs, int64_t endNs) noexcept {
+        sessionStartNs_ = startNs;
+        sessionEndNs_ = endNs;
+        sessionDurationNs_ = endNs - startNs;
+    }
+
+    /**
+     * @brief Update current time. Must be called each tick.
+     *
+     * Computes tau = (T_end - t) / (T_end - T_start), the fraction of
+     * trading session remaining. As tau -> 0, the model becomes more
+     * aggressive about flattening inventory.
+     *
+     * @param currentTimeNs Current timestamp in nanoseconds
+     */
+    void updateTime(int64_t currentTimeNs) noexcept {
+        if (sessionDurationNs_ <= 0) {
+            tau_ = 1.0;  // Default: full session remaining
+            return;
+        }
+
+        int64_t remaining = sessionEndNs_ - currentTimeNs;
+        tau_ = std::max(kMinTau, static_cast<double>(remaining)
+                                 / static_cast<double>(sessionDurationNs_));
+    }
+
+    /**
+     * @brief Get current time-remaining fraction.
+     */
+    [[nodiscard]] double tau() const noexcept { return tau_; }
 
     // ========================================================================
     // State
     // ========================================================================
 
-    /**
-     * @brief Set current inventory position.
-     * @param inv Signed inventory (positive = long, negative = short)
-     */
     void setInventory(int32_t inv) noexcept { inventory_ = inv; }
-    
-    /**
-     * @brief Get current inventory.
-     */
     [[nodiscard]] int32_t inventory() const noexcept { return inventory_; }
 
+    /**
+     * @brief Set risk manager for pre-trade checks.
+     */
+    void setRiskManager(risk::RiskManager* rm) noexcept { riskManager_ = rm; }
+
     // ========================================================================
-    // Core Logic
+    // Core Avellaneda-Stoikov Formulas
     // ========================================================================
 
     /**
      * @brief Compute reservation price.
-     * 
-     * r = s - q * γ * σ² * (T - t)
-     * 
-     * Where:
-     *   s = fair price
-     *   q = inventory
-     *   γ = risk aversion
-     *   σ = volatility
-     *   T-t = time remaining
-     * 
-     * @param fairPrice Current fair price estimate
-     * @param volatility Current volatility estimate
+     *
+     * r(s,q,t) = s - q * gamma * sigma^2 * tau
+     *
+     * The reservation price is the market maker's indifference price:
+     * the price at which they are equally happy to buy or sell.
+     * - When long (q > 0), reservation price drops below mid to incentivize
+     *   selling and reduce inventory.
+     * - As tau -> 0 (near session end), the penalty increases, pushing
+     *   prices more aggressively toward flattening.
+     *
+     * @param fairPrice Current fair price (mid or model estimate)
+     * @param sigma     Volatility (annualized or per-tick, must be consistent)
      * @return Reservation price
      */
-    [[nodiscard]] double reservationPrice(double fairPrice, double volatility) const noexcept {
-        return fairPrice - inventory_ * gamma * volatility * volatility * T;
+    [[nodiscard]] double reservationPrice(double fairPrice, double sigma) const noexcept {
+        return fairPrice - inventory_ * gamma * sigma * sigma * tau_;
     }
 
     /**
-     * @brief Compute optimal spread.
-     * 
-     * δ = γ * σ² * (T - t) + (2/γ) * log(1 + γ/k)
-     * 
-     * Simplified: δ ≈ baseSpread + |inventory| * gamma
+     * @brief Compute optimal spread (full A-S closed form).
+     *
+     * delta = gamma * sigma^2 * tau + (2/gamma) * ln(1 + gamma/k)
+     *
+     * Two components:
+     *   1. gamma*sigma^2*tau: inventory risk premium, decreases as session ends
+     *   2. (2/gamma)*ln(1+gamma/k): adverse selection premium from order flow
+     *      intensity. This is the KEY term missing from simplified versions.
+     *      It represents the compensation the MM requires given that fills
+     *      arrive at rate lambda(delta) = A*exp(-k*delta).
+     *
+     * @param sigma Volatility estimate
+     * @return Optimal half-spread (total spread = 2 * result)
      */
-    [[nodiscard]] double optimalSpread(double volatility) const noexcept {
-        return baseSpread + std::abs(inventory_) * gamma * volatility;
+    [[nodiscard]] double optimalSpread(double sigma) const noexcept {
+        double inventoryRiskPremium = gamma * sigma * sigma * tau_;
+        double adverseSelectionPremium = (2.0 / gamma) * std::log(1.0 + gamma / k);
+        return std::max(minSpread, inventoryRiskPremium + adverseSelectionPremium);
     }
 
     /**
-     * @brief Compute market making quotes.
-     * 
-     * @param fairPrice Fair price estimate (from spread model)
-     * @param volatility Current volatility
-     * @param zScore Spread z-score
-     * @param ofiValue OFI normalized value
-     * @return Quote with bid/ask prices and sizes
+     * @brief Simplified spread (no intensity term).
+     * Kept for comparison and baseline benchmarking.
      */
-    [[nodiscard]] Quote computeQuotes(double fairPrice, double volatility,
-                                       double zScore = 0, double ofiValue = 0) const {
+    [[deprecated("Use optimalSpread() with intensity parameter k")]]
+    [[nodiscard]] double optimalSpreadSimplified(double sigma) const noexcept {
+        return std::max(minSpread, minSpread + std::abs(inventory_) * gamma * sigma);
+    }
+
+    /**
+     * @brief Calibrate order intensity parameter k from fill data.
+     *
+     * Fits lambda(delta) = A * exp(-k * delta) via log-linear OLS.
+     * Given observed (spread_i, fillRate_i) pairs:
+     *   log(fillRate_i) = log(A) - k * spread_i
+     *
+     * @param spreads    Observed spread widths
+     * @param fillRates  Corresponding fill rates (fills per unit time)
+     * @return Calibrated k, or -1 if insufficient data
+     */
+    static double calibrateIntensity(const std::vector<double>& spreads,
+                                     const std::vector<double>& fillRates) {
+        if (spreads.size() != fillRates.size() || spreads.size() < 5) return -1.0;
+
+        // Log-linear OLS: log(fillRate) = logA - k * spread
+        double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+        size_t validCount = 0;
+
+        for (size_t i = 0; i < spreads.size(); ++i) {
+            if (fillRates[i] <= 0 || spreads[i] <= 0) continue;
+            double x = spreads[i];
+            double y = std::log(fillRates[i]);
+            sumX += x;
+            sumY += y;
+            sumXY += x * y;
+            sumX2 += x * x;
+            validCount++;
+        }
+
+        if (validCount < 5) return -1.0;
+
+        double n = static_cast<double>(validCount);
+        double varX = sumX2 / n - (sumX / n) * (sumX / n);
+        double covXY = sumXY / n - (sumX / n) * (sumY / n);
+
+        if (std::abs(varX) < 1e-15) return -1.0;
+
+        // k = -slope (since log(lambda) = logA - k*delta)
+        double slope = covXY / varX;
+        return std::max(0.01, -slope);
+    }
+
+    // ========================================================================
+    // Quote Generation
+    // ========================================================================
+
+    /**
+     * @brief Compute optimal market making quotes.
+     *
+     * Full pipeline:
+     *   1. Compute reservation price (inventory-adjusted fair value)
+     *   2. Compute optimal spread (intensity + risk premium)
+     *   3. Apply microstructure signal modulation (VPIN, Kyle)
+     *   4. Apply directional signal gating (z-score, OFI)
+     *   5. Run pre-trade risk checks
+     *
+     * @param fairPrice Fair price estimate
+     * @param sigma     Volatility
+     * @param zScore    Spread z-score (for directional signal)
+     * @param ofiValue  OFI normalized value (for signal confirmation)
+     * @param vpinValue VPIN value (0 to 1, for toxicity adjustment)
+     * @param kyleLambdaNorm Normalized Kyle's lambda (for impact adjustment)
+     * @return Quote with bid/ask prices, sizes, and risk check result
+     */
+    [[nodiscard]] Quote computeQuotes(
+        double fairPrice, double sigma,
+        double zScore = 0, double ofiValue = 0,
+        double vpinValue = 0, double kyleLambdaNorm = 0) const noexcept {
+
         Quote quote;
-        
-        // Check inventory limits
+
+        // Check inventory limits: if at max, only quote to reduce
         if (std::abs(inventory_) >= maxInventory) {
-            // Only quote to reduce inventory
             if (inventory_ > 0) {
                 quote.askPrice = static_cast<Price>(fairPrice);
                 quote.askSize = defaultSize;
@@ -154,48 +305,94 @@ public:
             return quote;
         }
 
-        // Compute reservation price
-        double r = reservationPrice(fairPrice, volatility);
-        double spread = optimalSpread(volatility);
-        
-        // Base quotes
-        double bidPrice = r - spread / 2.0;
-        double askPrice = r + spread / 2.0;
-        
-        // Signal gating
+        // 1. Reservation price
+        double r = reservationPrice(fairPrice, sigma);
+
+        // 2. Optimal spread
+        double delta = optimalSpread(sigma);
+
+        // 3. Microstructure signal modulation
+        // Widen spread when toxicity or impact is elevated
+        double signalMultiplier = 1.0
+            + alphaVpin * std::max(0.0, vpinValue - 0.3)    // Activate above baseline
+            + alphaLambda * std::max(0.0, kyleLambdaNorm);   // Always positive contribution
+        delta *= signalMultiplier;
+
+        // 4. Compute raw bid/ask
+        double bidPrice = r - delta / 2.0;
+        double askPrice = r + delta / 2.0;
+
+        // 5. Directional signal gating (z-score + OFI)
         bool enterLong = (zScore < -zEntryThreshold) && (ofiValue > -ofiThreshold);
         bool enterShort = (zScore > zEntryThreshold) && (ofiValue < ofiThreshold);
         bool exitLong = (zScore > -zExitThreshold) && (inventory_ > 0);
         bool exitShort = (zScore < zExitThreshold) && (inventory_ < 0);
-        
-        // Adjust quotes based on signals
+
+        // Adjust quotes and sizes based on signals
         if (enterLong || exitShort) {
-            // Aggressive bid
-            bidPrice += 1;
+            bidPrice += 1;  // Tighten bid to attract fills
             quote.bidSize = defaultSize * 2;
         } else {
             quote.bidSize = defaultSize;
         }
-        
+
         if (enterShort || exitLong) {
-            // Aggressive ask
-            askPrice -= 1;
+            askPrice -= 1;  // Tighten ask to attract fills
             quote.askSize = defaultSize * 2;
         } else {
             quote.askSize = defaultSize;
         }
-        
+
+        // Inventory-based size scaling: reduce size on the side that would
+        // increase position when near limits
+        double inventoryFraction = static_cast<double>(std::abs(inventory_))
+                                   / static_cast<double>(maxInventory);
+        if (inventoryFraction > 0.7) {
+            if (inventory_ > 0) {
+                quote.bidSize = static_cast<Quantity>(
+                    quote.bidSize * (1.0 - inventoryFraction));
+                quote.bidSize = std::max(quote.bidSize, Quantity(1));
+            } else {
+                quote.askSize = static_cast<Quantity>(
+                    quote.askSize * (1.0 - inventoryFraction));
+                quote.askSize = std::max(quote.askSize, Quantity(1));
+            }
+        }
+
         quote.bidPrice = static_cast<Price>(std::max(0.0, bidPrice));
         quote.askPrice = static_cast<Price>(askPrice);
-        quote.valid = true;
-        
+
+        // 6. Pre-trade risk check (if risk manager attached)
+        if (riskManager_) {
+            // Check both sides
+            auto bidCheck = riskManager_->preTradeCheck(
+                0, OrderSide::Buy, quote.bidSize, quote.bidPrice);
+            auto askCheck = riskManager_->preTradeCheck(
+                0, OrderSide::Sell, quote.askSize, quote.askPrice);
+
+            if (bidCheck != risk::RiskCheckResult::Passed) {
+                quote.bidPrice = PRICE_INVALID;
+                quote.bidSize = 0;
+            }
+            if (askCheck != risk::RiskCheckResult::Passed) {
+                quote.askPrice = PRICE_INVALID;
+                quote.askSize = 0;
+            }
+
+            // Report worst rejection
+            if (bidCheck != risk::RiskCheckResult::Passed) {
+                quote.riskCheck = bidCheck;
+            } else if (askCheck != risk::RiskCheckResult::Passed) {
+                quote.riskCheck = askCheck;
+            }
+        }
+
+        quote.valid = (quote.bidPrice != PRICE_INVALID || quote.askPrice != PRICE_INVALID);
         return quote;
     }
 
     /**
      * @brief Update inventory after a fill.
-     * @param side Side of the fill
-     * @param quantity Filled quantity
      */
     void onFill(OrderSide side, Quantity quantity) noexcept {
         if (side == OrderSide::Buy) {
@@ -210,10 +407,23 @@ public:
      */
     void reset() noexcept {
         inventory_ = 0;
+        tau_ = 1.0;
     }
 
 private:
     int32_t inventory_ = 0;
+
+    // Session time state
+    int64_t sessionStartNs_ = 0;
+    int64_t sessionEndNs_ = 0;
+    int64_t sessionDurationNs_ = 0;
+    double tau_ = 1.0;  ///< Time remaining fraction (1.0 = full session)
+
+    // Risk manager (optional, not owned)
+    risk::RiskManager* riskManager_ = nullptr;
+
+    /// Minimum tau to prevent division instability at session end
+    static constexpr double kMinTau = 0.001;
 };
 
 } // namespace strategy

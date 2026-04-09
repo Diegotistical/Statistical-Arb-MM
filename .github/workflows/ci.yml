@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ ninja-build
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O2 -std=c++20 -Wall -Wextra"
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Unit Tests - OrderBook
+        run: ./bin/orderbook_tests
+
+      - name: Unit Tests - Strategy (Avellaneda-Stoikov)
+        run: ./bin/strategy_tests
+
+      - name: Unit Tests - Kalman Filter
+        run: ./bin/kalman_tests
+
+      - name: Unit Tests - Risk Management
+        run: ./bin/risk_tests
+
+      - name: Statistical Tests - Cointegration (EG, Johansen, OU MLE)
+        run: ./bin/cointegration_gtest
+
+      - name: Integration Tests (Pipeline + Walk-Forward)
+        run: ./bin/integration_tests
+
+      - name: Replay Tests
+        run: ./bin/replay_tests

@@ -1,115 +1,144 @@
 #pragma once
 /**
  * @file SpreadModel.hpp
- * @brief Rolling z-score spread model for stat-arb.
- * 
- * Computes:
- *   spread = log(price_A) - β * log(price_B)
- *   z = (spread - μ) / σ
- * 
- * Where μ and σ are rolling estimates.
+ * @brief Rolling z-score spread model with optional Kalman-filtered hedge ratio.
+ *
+ * Two modes of operation:
+ *   1. Static beta: spread = log(A) - beta * log(B), z = (spread - mu) / sigma
+ *      where mu and sigma are rolling window estimates. Simple and fast.
+ *
+ *   2. Kalman-filtered beta: hedge ratio adapts online via the Kalman filter
+ *      from KalmanFilter.hpp. The z-score uses the Kalman innovation variance
+ *      which naturally accounts for parameter estimation uncertainty.
+ *
+ * Mode 2 is preferred because:
+ *   - Beta tracks structural changes (regime shifts, corporate events)
+ *   - Z-score uncertainty correctly reflects estimation error
+ *   - No arbitrary lookback window for beta estimation
+ *
+ * The rolling window z-score (mode 1) is still useful as a baseline
+ * for comparison and for contexts where simplicity is preferred.
  */
 
 #include <cmath>
 #include <deque>
 
+#include "KalmanFilter.hpp"
+
 namespace signals {
 
 /**
- * @brief Rolling z-score spread model.
- * 
- * Usage:
+ * @brief Rolling z-score spread model with optional Kalman integration.
+ *
+ * Usage (static beta):
  * @code
- *   SpreadModel model(100);  // 100-tick lookback
+ *   SpreadModel model(100, 1.0);
  *   double z = model.update(mid_AAPL, mid_MSFT);
- *   if (z > 2.0) { // Spread is 2σ above mean }
+ * @endcode
+ *
+ * Usage (Kalman-filtered beta):
+ * @code
+ *   KalmanHedgeRatio kf(0.9999, 1e-3);
+ *   SpreadModel model(100);
+ *   model.setKalmanFilter(&kf);
+ *   double z = model.update(mid_AAPL, mid_MSFT);
+ *   double hedgeRatio = model.beta();  // Dynamic!
  * @endcode
  */
 class SpreadModel {
 public:
     /**
      * @brief Construct spread model.
-     * @param lookback Rolling window size
-     * @param beta Hedge ratio (default 1.0 for pairs)
+     * @param lookback Rolling window size for mean/std estimation
+     * @param beta Static hedge ratio (ignored if Kalman filter is set)
      */
     explicit SpreadModel(size_t lookback = 100, double beta = 1.0)
-        : lookback_(lookback), beta_(beta), 
-          sum_(0), sumSq_(0), count_(0), spread_(0), z_(0) {}
+        : lookback_(lookback), beta_(beta),
+          sum_(0), sumSq_(0), count_(0), spread_(0), z_(0),
+          kalman_(nullptr) {}
+
+    /**
+     * @brief Attach a Kalman filter for dynamic hedge ratio tracking.
+     * When set, the filter's beta replaces the static beta_ on each update.
+     * @param kf Pointer to KalmanHedgeRatio (not owned, must outlive this)
+     */
+    void setKalmanFilter(KalmanHedgeRatio* kf) noexcept { kalman_ = kf; }
 
     /**
      * @brief Update model with new prices.
      * @param priceA First asset price (e.g., AAPL)
      * @param priceB Second asset price (e.g., MSFT)
-     * @return Current z-score
+     * @return Current z-score (Kalman or rolling, depending on mode)
      */
     double update(double priceA, double priceB) {
-        // Compute log spread
-        spread_ = std::log(priceA) - beta_ * std::log(priceB);
-        
-        // Add to window
-        window_.push_back(spread_);
-        sum_ += spread_;
-        sumSq_ += spread_ * spread_;
-        count_++;
-        
-        // Remove old if window full
-        if (window_.size() > lookback_) {
-            double old = window_.front();
-            window_.pop_front();
-            sum_ -= old;
-            sumSq_ -= old * old;
-            count_--;
+        double logA = std::log(priceA);
+        double logB = std::log(priceB);
+
+        if (kalman_) {
+            // Mode 2: Kalman-filtered hedge ratio
+            kalmanState_ = kalman_->update(logA, logB);
+            beta_ = kalmanState_.beta;
+            spread_ = kalmanState_.spread;  // Innovation = actual - predicted
+            z_ = kalmanState_.zScore();     // Uses Kalman uncertainty
+
+            // Also update rolling window for backward compatibility
+            updateRollingWindow(spread_);
+
+            return z_;
         }
-        
-        // Compute z-score
+
+        // Mode 1: Static beta, rolling z-score
+        spread_ = logA - beta_ * logB;
+        updateRollingWindow(spread_);
+
+        // Compute rolling z-score
         if (count_ >= 2) {
-            double mean = sum_ / count_;
-            double variance = (sumSq_ / count_) - (mean * mean);
+            double mean = sum_ / static_cast<double>(count_);
+            double variance = (sumSq_ / static_cast<double>(count_)) - (mean * mean);
             double std = std::sqrt(std::max(variance, 1e-10));
             z_ = (spread_ - mean) / std;
         } else {
             z_ = 0;
         }
-        
+
         return z_;
     }
 
-    /**
-     * @brief Get current z-score.
-     */
+    // ========================================================================
+    // Accessors
+    // ========================================================================
+
     [[nodiscard]] double zScore() const noexcept { return z_; }
-    
-    /**
-     * @brief Get current spread value.
-     */
     [[nodiscard]] double spread() const noexcept { return spread_; }
-    
-    /**
-     * @brief Get rolling mean.
-     */
-    [[nodiscard]] double mean() const noexcept { 
-        return count_ > 0 ? sum_ / count_ : 0; 
+    [[nodiscard]] double beta() const noexcept { return beta_; }
+
+    [[nodiscard]] double mean() const noexcept {
+        return count_ > 0 ? sum_ / static_cast<double>(count_) : 0;
     }
-    
-    /**
-     * @brief Get rolling standard deviation.
-     */
+
     [[nodiscard]] double stdDev() const noexcept {
         if (count_ < 2) return 0;
-        double m = sum_ / count_;
-        double var = (sumSq_ / count_) - (m * m);
+        double m = sum_ / static_cast<double>(count_);
+        double var = (sumSq_ / static_cast<double>(count_)) - (m * m);
         return std::sqrt(std::max(var, 0.0));
     }
 
     /**
-     * @brief Set hedge ratio.
+     * @brief Get Kalman state (only valid if Kalman filter is attached).
+     */
+    [[nodiscard]] const KalmanState& kalmanState() const noexcept {
+        return kalmanState_;
+    }
+
+    /**
+     * @brief Check if Kalman filter is active.
+     */
+    [[nodiscard]] bool isKalmanActive() const noexcept { return kalman_ != nullptr; }
+
+    /**
+     * @brief Set static hedge ratio (only effective if Kalman is not attached).
      */
     void setBeta(double beta) noexcept { beta_ = beta; }
-    
-    /**
-     * @brief Get hedge ratio.
-     */
-    [[nodiscard]] double beta() const noexcept { return beta_; }
 
     /**
      * @brief Reset model state.
@@ -118,6 +147,8 @@ public:
         window_.clear();
         sum_ = sumSq_ = spread_ = z_ = 0;
         count_ = 0;
+        kalmanState_ = KalmanState{};
+        if (kalman_) kalman_->reset();
     }
 
 private:
@@ -129,6 +160,25 @@ private:
     size_t count_;
     double spread_;
     double z_;
+
+    // Kalman filter integration
+    KalmanHedgeRatio* kalman_;
+    KalmanState kalmanState_{};
+
+    void updateRollingWindow(double value) {
+        window_.push_back(value);
+        sum_ += value;
+        sumSq_ += value * value;
+        count_++;
+
+        if (window_.size() > lookback_) {
+            double old = window_.front();
+            window_.pop_front();
+            sum_ -= old;
+            sumSq_ -= old * old;
+            count_--;
+        }
+    }
 };
 
 } // namespace signals

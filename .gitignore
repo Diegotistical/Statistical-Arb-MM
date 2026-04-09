@@ -31,3 +31,6 @@ data/processed/*
 # --- System ---
 .env
 .DS_Store
+
+# --- Claude Code ---
+.claude/

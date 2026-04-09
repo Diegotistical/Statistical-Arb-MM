@@ -14,8 +14,8 @@
 #include <iostream>
 #include <sstream>
 
-#include "../src/replay/LobsterParser.hpp"
-#include "../src/replay/ReplayEngine.hpp"
+#include "../../src/replay/LobsterParser.hpp"
+#include "../../src/replay/ReplayEngine.hpp"
 
 // ============================================================================
 // Test Framework

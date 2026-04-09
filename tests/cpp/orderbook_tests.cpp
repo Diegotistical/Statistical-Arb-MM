@@ -19,9 +19,9 @@
 #include <string>
 #include <vector>
 
-#include "../src/core/OrderBook.hpp"
-#include "../src/core/MatchingStrategy.hpp"
-#include "../src/core/TickNormalizer.hpp"
+#include "../../src/core/OrderBook.hpp"
+#include "../../src/core/MatchingStrategy.hpp"
+#include "../../src/core/TickNormalizer.hpp"
 
 // ============================================================================
 // Test Framework (minimal)
